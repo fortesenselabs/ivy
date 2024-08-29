@@ -64,6 +64,69 @@ def get_item(
     return x[query]
 
 
+def set_item(
+    x: Union[tf.Tensor, tf.Variable],
+    query: Union[tf.Tensor, tf.Variable, Tuple],
+    val: Union[tf.Tensor, tf.Variable],
+    /,
+    *,
+    copy: Optional[bool] = False,
+) -> Union[tf.Tensor, tf.Variable]:
+    val = tf.cast(val, x.dtype)
+    
+    x_shape = tf.shape(x)
+    x_rank = tf.rank(x)
+    val_shape = tf.shape(val)
+    val_rank = tf.rank(val)
+    
+    
+    # Convert slices to explicit ranges
+    indices_slices = []
+    for dim, q in enumerate(query):
+        if isinstance(q, slice):
+            start, stop, step = q.start, q.stop, q.step
+            start = start if start is not None else 0
+            stop = stop if stop is not None else x_shape[dim]
+            step = step if step is not None else 1
+            indices_slices.append(tf.range(start, stop, step))
+        else:  # int or tensor, which directly indexes the dimension
+            indices_slices.append(tf.constant([q]))
+
+    # Create a meshgrid of indices
+    indices_grid = tf.meshgrid(*indices_slices, indexing='ij')
+    indices = tf.stack(indices_grid, axis=-1)
+
+    # Reshape indices to a list of index tuples
+    indices = tf.reshape(indices, [-1, len(query)])
+
+    # Flatten the values if necessary
+    # if tf.size(val) == 1 and tf.size(indices) > 1:
+    #     val = tf.broadcast_to(val, [tf.size(indices)])
+    
+    # if tf.size(val) == tf.size(indices):
+    #     val = tf.reshape(val, tf.shape(indices)[:-1])
+    
+    indices_shape = tf.stack(tf.unstack(tf.shape(val)) + [tf.rank(val)], axis=-1)
+    n_elements_indices = tf.reduce_prod(tf.shape(indices)[:-1])
+
+    while tf.reduce_prod(tf.shape(val)) < n_elements_indices:        
+        new_dim_size = x_shape[x_rank - tf.rank(val) - 1]
+
+        val_shape = tf.shape(val)
+        val = tf.expand_dims(val, axis=0)
+        val = tf.tile(
+            val,
+            [new_dim_size] + tf.unstack(tf.ones_like(val_shape, dtype=tf.int32)),
+        )
+    
+    indices_shape = tf.stack(tf.unstack(tf.shape(val)) + [tf.rank(val)], axis=-1)
+    print(indices.shape, indices_shape, val.shape)
+
+    indices = tf.reshape(indices, indices_shape)
+    updated_x = tf.tensor_scatter_nd_update(x, indices, val)
+    return updated_x
+
+
 def to_numpy(x: Union[tf.Tensor, tf.Variable], /, *, copy: bool = True) -> np.ndarray:
     # TensorFlow fails to convert bfloat16 tensor when it has 0 dimensions
     if (
