@@ -113,7 +113,7 @@ def set_item(
         if len(query) > x_rank:
             new_query = []
             for i, q in enumerate(query):
-                if q != slice(None, None, None) and q != None:
+                if not isinstance(q, (tf.Tensor, tf.Variable)) and q != slice(None, None, None) and q != None:
                     new_query.append(q)
                     if len(new_query) == x_rank:
                         break
@@ -127,6 +127,7 @@ def set_item(
         
         # convert slices to explicit ranges
         indices_slices = []
+        val_tiling_dims = []
         for dim, q in enumerate(query):
             if isinstance(q, slice):
                 start, stop, step = q.start, q.stop, q.step
@@ -151,35 +152,42 @@ def set_item(
                     if step != 1: stop += 1  # account for the fact that stop is non-inclusive
                     indices_slices.append(tf.range(start, stop, step))
                 else:
-                    stop = stop if stop is not None else x_shape[start_dim + dim]
+                    stop = stop if stop is not None else 0
 
                     while stop - step < 0:
                         stop -= step
 
-                    stop += x_shape[start_dim + dim]
-                    
+                    if stop < 0:
+                        stop += x_shape[start_dim + dim]
+
                     if start is not None:
                         while start < 0:
                             start += x_shape[start_dim + dim]
                         while start > x_shape[start_dim + dim]:
                             start -= x_shape[start_dim + dim]
+                        start += 1
                     else:
                         start = 0
                     if step > stop:
                         step = stop
+                    if stop == start:
+                        stop += 1
 
                     if stop > start:
-                        indices_slices.append(tf.range(stop, start, step) - 1)
+                        indices_slices.append(tf.range(stop, start, step))
                     else:
                         indices_slices.append(tf.range(start, stop, step) - 1)
+                val_tiling_dims.append(slice(start, stop, step))
             elif q is None:
                 indices_slices.append(tf.range(0, x_shape[start_dim + dim], 1))
+                val_tiling_dims.append(None)
             else:  # int or tensor, which directly indexes the dimension
                 if isinstance(q, int):
                     # convert negative indices to positive
                     while q < 0:
                         q += x_shape[start_dim + dim]
                 indices_slices.append(q if isinstance(q, tf.Tensor) else tf.constant([q]))
+                val_tiling_dims.append(q)
 
         # create a meshgrid of indices
         indices_grid = tf.meshgrid(*indices_slices, indexing='ij')
@@ -191,7 +199,7 @@ def set_item(
         # convert negative indices to positive
         if tf.reduce_any(indices < 0):
             indices = tf.where(indices < 0, indices + x_shape[start_dim:], indices)
-        
+
         if tf.reduce_prod(tf.shape(indices)) == 0:
             return x
 
@@ -200,7 +208,7 @@ def set_item(
 
         # tile val to match the shape of indices
         while tf.reduce_prod(tf.shape(val)) < n_elements_indices:
-            new_dim = query[x_rank - tf.rank(val) - 1]
+            new_dim = val_tiling_dims[x_rank - tf.rank(val) - 1]
             if isinstance(new_dim, slice):
                 step = new_dim.step if new_dim.step is not None else 1
                 if step > 0:
