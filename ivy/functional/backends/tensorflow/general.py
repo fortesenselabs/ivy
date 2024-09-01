@@ -72,59 +72,186 @@ def set_item(
     *,
     copy: Optional[bool] = False,
 ) -> Union[tf.Tensor, tf.Variable]:
+
     val = tf.cast(val, x.dtype)
-    
-    x_shape = tf.shape(x)
-    x_rank = tf.rank(x)
-    val_shape = tf.shape(val)
-    val_rank = tf.rank(val)
-    
-    
-    # Convert slices to explicit ranges
-    indices_slices = []
-    for dim, q in enumerate(query):
-        if isinstance(q, slice):
-            start, stop, step = q.start, q.stop, q.step
-            start = start if start is not None else 0
-            stop = stop if stop is not None else x_shape[dim]
-            step = step if step is not None else 1
-            indices_slices.append(tf.range(start, stop, step))
-        else:  # int or tensor, which directly indexes the dimension
-            indices_slices.append(tf.constant([q]))
 
-    # Create a meshgrid of indices
-    indices_grid = tf.meshgrid(*indices_slices, indexing='ij')
-    indices = tf.stack(indices_grid, axis=-1)
+    if not isinstance(query, (tf.Tensor, tf.Variable)):
+        if query == Ellipsis:
+            query = (slice(None, None, None),) * tf.rank(x)
+        if tf.reduce_prod(tf.shape(val)) == 0 or tf.reduce_prod(tf.shape(x)) == 0:
+            return x
+        if query is None and not tf.experimental.numpy.allclose(tf.shape(x), tf.shape(val)):
+            if tf.reduce_prod(tf.shape(val)) == 1:
+                return tf.fill(tf.shape(x), val)
+            return x #val
+        if isinstance(query, slice):
+            query = (query,)
 
-    # Reshape indices to a list of index tuples
-    indices = tf.reshape(indices, [-1, len(query)])
-
-    # Flatten the values if necessary
-    # if tf.size(val) == 1 and tf.size(indices) > 1:
-    #     val = tf.broadcast_to(val, [tf.size(indices)])
-    
-    # if tf.size(val) == tf.size(indices):
-    #     val = tf.reshape(val, tf.shape(indices)[:-1])
-    
-    indices_shape = tf.stack(tf.unstack(tf.shape(val)) + [tf.rank(val)], axis=-1)
-    n_elements_indices = tf.reduce_prod(tf.shape(indices)[:-1])
-
-    while tf.reduce_prod(tf.shape(val)) < n_elements_indices:        
-        new_dim_size = x_shape[x_rank - tf.rank(val) - 1]
-
+        x_shape = tf.shape(x)
+        x_rank = tf.rank(x)
         val_shape = tf.shape(val)
-        val = tf.expand_dims(val, axis=0)
-        val = tf.tile(
-            val,
-            [new_dim_size] + tf.unstack(tf.ones_like(val_shape, dtype=tf.int32)),
-        )
-    
-    indices_shape = tf.stack(tf.unstack(tf.shape(val)) + [tf.rank(val)], axis=-1)
-    print(indices.shape, indices_shape, val.shape)
+        val_rank = tf.rank(val)
 
-    indices = tf.reshape(indices, indices_shape)
-    updated_x = tf.tensor_scatter_nd_update(x, indices, val)
-    return updated_x
+        # replace ellipsis with the appropriate number of slice(None, None, None)
+        query = list(query)
+        if any([q == Ellipsis for q in query if not isinstance(q, (tf.Tensor, tf.Variable))]):
+            ellipsis_idx = query.index(Ellipsis)
+            print('ellipsis_idx', ellipsis_idx)
+            new_query = []
+            for i in range(ellipsis_idx):
+                new_query.append(query[i])
+            for _ in range(x_rank - len(query) + 1):
+                new_query.append(slice(None, None, None))
+            for i in range(ellipsis_idx + 1, len(query)):
+                new_query.append(query[i])
+            query = new_query
+
+        while len(query) < x_rank:
+            query.append(slice(None, None, None))
+    
+        # extract the relevant part of the query if the query has more dimensions than x
+        if len(query) > x_rank:
+            new_query = []
+            for i, q in enumerate(query):
+                if q != slice(None, None, None) and q != None:
+                    new_query.append(q)
+                    if len(new_query) == x_rank:
+                        break
+                if (len(query) - i) + len(new_query) == x_rank:
+                    new_query.extend(query[i:])
+                    break
+            query = tuple(new_query)
+
+        # the first dimension to slice (how the query dims line up with the x dims when not the same rank)
+        start_dim = x_rank - len(query)
+        
+        # convert slices to explicit ranges
+        indices_slices = []
+        for dim, q in enumerate(query):
+            if isinstance(q, slice):
+                start, stop, step = q.start, q.stop, q.step
+                step = step if step is not None else 1
+                
+                if step >= 0:
+                    start = start if start is not None else 0
+                    stop = stop if stop is not None else x_shape[start_dim + dim]
+                    
+                    while start < 0:
+                        start += x_shape[start_dim + dim]
+                    while stop < 0:
+                        stop += x_shape[start_dim + dim]
+                    while start > x_shape[start_dim + dim]:
+                        start -= x_shape[start_dim + dim]
+                    while stop > x_shape[start_dim + dim]:
+                        stop -= x_shape[start_dim + dim]
+                    
+                    while stop < start:
+                        stop += x_shape[start_dim + dim]
+
+                    if step != 1: stop += 1  # account for the fact that stop is non-inclusive
+                    indices_slices.append(tf.range(start, stop, step))
+                else:
+                    stop = stop if stop is not None else x_shape[start_dim + dim]
+
+                    while stop - step < 0:
+                        stop -= step
+
+                    stop += x_shape[start_dim + dim]
+                    
+                    if start is not None:
+                        while start < 0:
+                            start += x_shape[start_dim + dim]
+                        while start > x_shape[start_dim + dim]:
+                            start -= x_shape[start_dim + dim]
+                    else:
+                        start = 0
+                    if step > stop:
+                        step = stop
+
+                    if stop > start:
+                        indices_slices.append(tf.range(stop, start, step) - 1)
+                    else:
+                        indices_slices.append(tf.range(start, stop, step) - 1)
+            elif q is None:
+                indices_slices.append(tf.range(0, x_shape[start_dim + dim], 1))
+            else:  # int or tensor, which directly indexes the dimension
+                if isinstance(q, int):
+                    # convert negative indices to positive
+                    while q < 0:
+                        q += x_shape[start_dim + dim]
+                indices_slices.append(q if isinstance(q, tf.Tensor) else tf.constant([q]))
+
+        # create a meshgrid of indices
+        indices_grid = tf.meshgrid(*indices_slices, indexing='ij')
+        indices = tf.stack(tf.convert_to_tensor(indices_grid, dtype=tf.int32), axis=-1)
+
+        # reshape indices to a list of index tuples
+        indices = tf.reshape(indices, [-1, len(query)])
+
+        # convert negative indices to positive
+        if tf.reduce_any(indices < 0):
+            indices = tf.where(indices < 0, indices + x_shape[start_dim:], indices)
+        
+        if tf.reduce_prod(tf.shape(indices)) == 0:
+            return x
+
+        n_elements_indices = tf.reduce_prod(tf.shape(indices)[:-1])
+        val = tf.squeeze(val)
+
+        # tile val to match the shape of indices
+        while tf.reduce_prod(tf.shape(val)) < n_elements_indices:
+            new_dim = query[x_rank - tf.rank(val) - 1]
+            if isinstance(new_dim, slice):
+                step = new_dim.step if new_dim.step is not None else 1
+                if step > 0:
+                    start = new_dim.start if new_dim.start is not None else 0
+                    stop = new_dim.stop if new_dim.stop is not None else x_shape[x_rank - tf.rank(val) - 1]
+                    step = tf.abs(step)
+                    new_dim_size = tf.minimum(tf.cast(tf.math.ceil(tf.divide((stop - start), step)), tf.int32), x_shape[x_rank - tf.rank(val) - 1])
+                else:
+                    stop = new_dim.stop if new_dim.stop is not None else 0
+                    start = new_dim.start if new_dim.start is not None else x_shape[x_rank - tf.rank(val) - 1]
+                    step = tf.abs(step)
+                    if start > stop:
+                        new_dim_size = tf.minimum(tf.cast(tf.math.ceil(tf.divide((start - stop), step)), tf.int32), x_shape[x_rank - tf.rank(val) - 1])
+                    else:
+                        new_dim_size = tf.minimum(tf.cast(tf.math.ceil(tf.divide((stop - start), step)), tf.int32), x_shape[x_rank - tf.rank(val) - 1])
+            elif isinstance(new_dim, int):
+                new_dim_size = 1
+            else:
+                new_dim_size = x_shape[x_rank - tf.rank(val) - 1]
+
+            val_shape = tf.shape(val)
+            val = tf.expand_dims(val, axis=0)
+            val = tf.tile(
+                val,
+                [new_dim_size] + tf.unstack(tf.ones_like(val_shape, dtype=tf.int32)),
+            )
+
+        # reshape val to match the shape of indices
+        n_elements_val = tf.reduce_prod(tf.shape(val))
+        new_val_shape = []
+        i = -1
+        while tf.reduce_prod(new_val_shape) < n_elements_val:
+            if not isinstance(query[i], (tf.Tensor, tf.Variable)) and (query[i] == slice(None, None, None) or query[i] is None):
+                new_val_shape.insert(0, x_shape[i])
+            else:
+                new_val_shape.insert(0, tf.shape(val)[i])
+            i -= 1
+
+        if len(new_val_shape) > 0:
+            val = tf.reshape(val, new_val_shape)
+        if tf.rank(val) == 0:
+            val = tf.expand_dims(val, 0)
+
+        # reshape indices to match the shape of val
+        indices_shape = tf.stack(tf.unstack(tf.shape(val)) + [x_rank], axis=-1)
+
+        indices = tf.reshape(indices, indices_shape)
+        updated_x = tf.tensor_scatter_nd_update(x, indices, val)
+        return updated_x
+    else:
+        raise Exception("not implemented yet for non-tuple query")
 
 
 def to_numpy(x: Union[tf.Tensor, tf.Variable], /, *, copy: bool = True) -> np.ndarray:
